@@ -11,6 +11,21 @@ struct CodexSession: Identifiable, Equatable, Sendable {
     let usage: CodexUsage?
 
     var deepLink: URL { URL(string: "codex://threads/\(id)")! }
+    var needsAttention: Bool { ["Requiere aprobación", "Requiere respuesta"].contains(activity) }
+
+    func applying(_ liveState: CodexLiveState) -> CodexSession {
+        guard let activity = liveState.activity else { return self }
+        return CodexSession(
+            id: id,
+            title: title,
+            project: project,
+            output: output,
+            activity: activity,
+            isRunning: isRunning,
+            updatedAt: updatedAt,
+            usage: usage
+        )
+    }
 }
 
 struct CodexUsage: Equatable, Sendable {
@@ -90,6 +105,10 @@ enum CodexSessionReader {
                 running = false
                 activity = "Completado"
                 sawCodexEvent = true
+            case ("event_msg", "turn_aborted"), ("event_msg", "thread_rolled_back"):
+                running = false
+                activity = "Interrumpido"
+                sawCodexEvent = true
             case ("event_msg", "agent_message"):
                 if let message = payload["message"] as? String, !message.isEmpty {
                     output = clean(message)
@@ -106,14 +125,14 @@ enum CodexSessionReader {
                     output = clean(text)
                     activity = running ? "Respondiendo" : activity
                 }
-            case ("response_item", "custom_tool_call"):
+            case ("response_item", "custom_tool_call"), ("response_item", "function_call"):
                 let name = payload["name"] as? String ?? "herramienta"
                 activity = activityLabel(for: name)
-                if let arguments = payload["arguments"] as? String,
-                   let detail = commandDetail(from: arguments) {
+                let input = (payload["arguments"] as? String) ?? (payload["input"] as? String)
+                if let input, let detail = commandDetail(from: input) {
                     output = detail
                 }
-            case ("response_item", "custom_tool_call_output"):
+            case ("response_item", "custom_tool_call_output"), ("response_item", "function_call_output"):
                 if let text = outputText(payload["output"]), !text.isEmpty {
                     output = clean(text)
                 }

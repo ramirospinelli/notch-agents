@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 import UserNotifications
 
@@ -19,14 +20,37 @@ func shouldCollapsePanel(expanded: Bool, panelFrame: NSRect, clickLocation: NSPo
     expanded && !panelFrame.contains(clickLocation)
 }
 
+func refreshInterval(hasActiveSessions: Bool) -> TimeInterval {
+    hasActiveSessions ? 2 : 10
+}
+
+func shouldAnimateMascot(isProcessing: Bool, reduceMotion: Bool) -> Bool {
+    isProcessing && !reduceMotion
+}
+
+func shouldPlayCompletionSound(preference: Bool?) -> Bool {
+    preference ?? true
+}
+
 @main
 struct NotchAgentsApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
+    @AppStorage("showsTaskContent") private var showsTaskContent = false
+    @AppStorage("playsCompletionSound") private var playsCompletionSound = true
+    @State private var startsAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some Scene {
         MenuBarExtra("Notch Agents", systemImage: "sparkles") {
             Button("Mostrar agentes") { delegate.showPanel(expanded: true) }
             Button("Actualizar ahora") { delegate.monitor.refresh() }
+            Toggle("Mostrar contenido de tareas", isOn: $showsTaskContent)
+            Toggle("Sonido suave al terminar", isOn: $playsCompletionSound)
+            Toggle("Abrir al iniciar sesión", isOn: $startsAtLogin)
+                .onChange(of: startsAtLogin) { _, enabled in
+                    if !delegate.setLaunchAtLogin(enabled) {
+                        startsAtLogin.toggle()
+                    }
+                }
             Divider()
             Button("Salir") { NSApplication.shared.terminate(nil) }
         }
@@ -41,10 +65,21 @@ final class AgentMonitor: ObservableObject {
     @Published var isExpanded = false
     var onSessionCompleted: ((CodexSession) -> Void)?
     private var timer: Timer?
+    private var timerInterval: TimeInterval?
+    private var liveStates: [String: CodexLiveState] = [:]
+    private var appServerClient: CodexAppServerClient?
 
     init() {
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        scheduleRefresh(every: 2)
+        startAppServer()
+    }
+
+    private func scheduleRefresh(every interval: TimeInterval) {
+        guard timerInterval != interval else { return }
+        timer?.invalidate()
+        timerInterval = interval
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
     }
@@ -56,13 +91,34 @@ final class AgentMonitor: ObservableObject {
             DispatchQueue.main.async {
                 let previouslyRunning = Set(self?.sessions.filter(\.isRunning).map(\.id) ?? [])
                 self?.agents = agents
-                let sorted = sessions.sorted { $0.isRunning && !$1.isRunning }
+                let currentSessions = sessions.map { session in
+                    guard let liveState = self?.liveStates[session.id] else { return session }
+                    return session.applying(liveState)
+                }
+                let sorted = currentSessions.sorted { $0.isRunning && !$1.isRunning }
                 self?.sessions = sorted
                 for session in sorted where previouslyRunning.contains(session.id) && !session.isRunning {
                     self?.onSessionCompleted?(session)
                 }
+                self?.scheduleRefresh(every: refreshInterval(hasActiveSessions: sorted.contains(where: \.isRunning)))
             }
         }
+    }
+
+    private func startAppServer() {
+        guard let client = CodexAppServerClient() else { return }
+        client.onEvent = { [weak self] event in
+            Task { @MainActor [weak self] in
+                if event.state == .idle {
+                    self?.liveStates.removeValue(forKey: event.threadID)
+                } else {
+                    self?.liveStates[event.threadID] = event.state
+                }
+                self?.refresh()
+            }
+        }
+        client.start()
+        appServerClient = client
     }
 
     nonisolated private static func runningAgents() -> [AgentProcess] {
@@ -99,8 +155,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var panel: NSPanel?
     private var globalClickMonitor: Any?
     private var localClickMonitor: Any?
+    private lazy var completionSound: NSSound? = {
+        let sound = NSSound(named: "Glass")
+        sound?.volume = 0.2
+        return sound
+    }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UserDefaults.standard.register(defaults: ["playsCompletionSound": true])
         let notifications = UNUserNotificationCenter.current()
         notifications.delegate = self
         notifications.requestAuthorization(options: [.alert, .sound]) { _, _ in }
@@ -132,6 +194,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         setExpanded(!monitor.isExpanded)
     }
 
+    func setLaunchAtLogin(_ enabled: Bool) -> Bool {
+        do {
+            if enabled {
+                if SMAppService.mainApp.status == .notRegistered {
+                    try SMAppService.mainApp.register()
+                }
+            } else if SMAppService.mainApp.status != .notRegistered {
+                try SMAppService.mainApp.unregister()
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
     private func setExpanded(_ expanded: Bool) {
         guard monitor.isExpanded != expanded else { return }
         monitor.isExpanded = expanded
@@ -161,12 +238,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         panel.becomesKeyOnlyIfNeeded = true
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
-        panel.contentView = NSHostingView(rootView: NotchView(monitor: monitor, onToggle: { [weak self] in self?.togglePanel() }))
+        panel.contentView = NSHostingView(rootView: NotchView(
+            monitor: monitor,
+            onToggle: { [weak self] in self?.togglePanel() }
+        ))
         return panel
     }
 
     private func resize(_ panel: NSPanel, animated: Bool) {
-        guard let screen = NSScreen.main else { return }
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main else { return }
         let notchWidth = screen.auxiliaryTopLeftArea.flatMap { left in
             screen.auxiliaryTopRightArea.map { $0.minX - left.maxX }
         }
@@ -181,9 +261,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private func notifyCompletion(_ session: CodexSession) {
         let content = UNMutableNotificationContent()
         content.title = "Codex terminó"
-        content.body = session.title
-        content.sound = .default
+        content.body = UserDefaults.standard.bool(forKey: "showsTaskContent") ? session.title : "Una tarea de Codex se completó"
         content.userInfo = ["threadId": session.id]
+        if shouldPlayCompletionSound(preference: UserDefaults.standard.object(forKey: "playsCompletionSound") as? Bool) {
+            completionSound?.play()
+        }
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: "codex-finished-\(session.id)", content: content, trigger: nil)
         )
@@ -212,6 +294,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
 struct NotchView: View {
     @ObservedObject var monitor: AgentMonitor
+    @AppStorage("showsTaskContent") private var showsTaskContent = false
     let onToggle: () -> Void
 
     var body: some View {
@@ -235,6 +318,7 @@ struct NotchView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Expandir panel de agentes")
             }
         }
         .foregroundStyle(.white)
@@ -268,6 +352,7 @@ struct NotchView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Contraer panel de agentes")
 
             if let usage = activeUsage {
                 UsageStrip(usage: usage)
@@ -291,9 +376,10 @@ struct NotchView: View {
                     LazyVStack(spacing: 8) {
                         ForEach(monitor.sessions) { session in
                             Button { monitor.openThread(session) } label: {
-                                SessionCard(session: session)
+                                SessionCard(session: session, showsTaskContent: showsTaskContent)
                             }
                             .buttonStyle(.plain)
+                            .accessibilityLabel("Abrir \(showsTaskContent ? session.title : "tarea de Codex")")
                         }
                     }
                 }
@@ -319,14 +405,15 @@ struct NotchView: View {
 
 private struct RetroMascot: View {
     let isProcessing: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 0.25, paused: !isProcessing)) { timeline in
+        TimelineView(.animation(minimumInterval: 0.25, paused: !shouldAnimateMascot(isProcessing: isProcessing, reduceMotion: reduceMotion))) { timeline in
             let alternate = Int(timeline.date.timeIntervalSinceReferenceDate * 4).isMultiple(of: 2)
             Text(isProcessing ? (alternate ? "▟•ᴗ•▙" : "▙•ᴗ•▟") : "▟-ᴗ-▙")
                 .font(.system(size: 9, weight: .black, design: .monospaced))
                 .foregroundStyle(isProcessing ? Color.green : Color.white.opacity(0.4))
-                .offset(y: isProcessing && alternate ? -1 : 0)
+                .offset(y: shouldAnimateMascot(isProcessing: isProcessing, reduceMotion: reduceMotion) && alternate ? -1 : 0)
         }
         .accessibilityLabel(isProcessing ? "Mascota procesando" : "Mascota en espera")
     }
@@ -384,13 +471,14 @@ private struct UsageMeter: View {
 
 private struct SessionCard: View {
     let session: CodexSession
+    let showsTaskContent: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Image(systemName: session.isRunning ? "waveform" : "checkmark.circle.fill")
-                    .foregroundStyle(session.isRunning ? Color.green : Color.white.opacity(0.4))
-                Text(session.title)
+                    .foregroundStyle(session.needsAttention ? Color.orange : (session.isRunning ? Color.green : Color.white.opacity(0.4)))
+                Text(showsTaskContent ? session.title : "Tarea de Codex")
                     .font(.system(size: 14, weight: .semibold, design: .rounded))
                     .lineLimit(1)
                 Spacer()
@@ -404,9 +492,9 @@ private struct SessionCard: View {
                 }
                 Text(session.activity)
                     .font(.system(size: 11, weight: .medium, design: .rounded))
-                    .foregroundStyle(session.isRunning ? Color.green : Color.white.opacity(0.45))
+                    .foregroundStyle(session.needsAttention ? Color.orange : (session.isRunning ? Color.green : Color.white.opacity(0.45)))
             }
-            Text(session.output)
+            Text(showsTaskContent ? session.output : "Contenido oculto")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.white.opacity(0.7))
                 .lineLimit(3)

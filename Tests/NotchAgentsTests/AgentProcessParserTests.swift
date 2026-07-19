@@ -30,6 +30,42 @@ import AppKit
     #expect(!shouldCollapsePanel(expanded: false, panelFrame: panel, clickLocation: NSPoint(x: 100, y: 100)))
 }
 
+@Test func slowsPollingWhenThereAreNoActiveSessions() {
+    #expect(refreshInterval(hasActiveSessions: true) == 2)
+    #expect(refreshInterval(hasActiveSessions: false) == 10)
+}
+
+@Test func stopsMascotAnimationWhenReducedMotionIsEnabled() {
+    #expect(shouldAnimateMascot(isProcessing: true, reduceMotion: false))
+    #expect(!shouldAnimateMascot(isProcessing: false, reduceMotion: false))
+    #expect(!shouldAnimateMascot(isProcessing: true, reduceMotion: true))
+}
+
+@Test func enablesTheCompletionCueUnlessTheUserDisablesIt() {
+    #expect(shouldPlayCompletionSound(preference: nil))
+    #expect(shouldPlayCompletionSound(preference: true))
+    #expect(!shouldPlayCompletionSound(preference: false))
+}
+
+@Test func readsCodexAppServerAttentionStates() throws {
+    let approval = try #require(CodexAppServerEvent.parse(#"{"method":"thread/status/changed","params":{"threadId":"thread-1","status":{"type":"active","activeFlags":["waitingOnApproval"]}}}"#))
+    let question = try #require(CodexAppServerEvent.parse(#"{"method":"thread/started","params":{"thread":{"id":"thread-2","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}}}"#))
+
+    #expect(approval.threadID == "thread-1")
+    #expect(approval.state == .waitingApproval)
+    #expect(question.threadID == "thread-2")
+    #expect(question.state == .waitingQuestion)
+
+    let approvalRequest = try #require(CodexAppServerEvent.parse(#"{"id":7,"method":"execCommandApproval","params":{"conversationId":"thread-3"}}"#))
+    #expect(approvalRequest.threadID == "thread-3")
+    #expect(approvalRequest.state == .waitingApproval)
+}
+
+@Test func connectsToTheRunningCodexServerWhenItsSocketExists() {
+    #expect(CodexAppServerClient.launchArguments(socketPath: "/tmp/codex.sock") == ["app-server", "proxy", "--sock", "/tmp/codex.sock"])
+    #expect(CodexAppServerClient.launchArguments(socketPath: nil) == ["app-server", "--listen", "stdio://"])
+}
+
 @Test func findsOnlyCodexProcesses() {
     let agents = AgentProcessParser.parse("""
     101 /usr/local/bin/codex --task auth
@@ -74,4 +110,29 @@ import AppKit
 
     let session = try #require(CodexSessionReader.parse(lines: lines, fallbackID: "fallback"))
     #expect(!session.isRunning)
+}
+
+@Test func marksAbortedSessionAsInterrupted() throws {
+    let lines = [
+        #"{"type":"session_meta","payload":{"id":"thread-3"}}"#,
+        #"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        #"{"type":"event_msg","payload":{"type":"turn_aborted"}}"#
+    ]
+
+    let session = try #require(CodexSessionReader.parse(lines: lines, fallbackID: "fallback"))
+    #expect(!session.isRunning)
+    #expect(session.activity == "Interrumpido")
+}
+
+@Test func readsCurrentFunctionCallsAndInputs() throws {
+    let lines = [
+        #"{"type":"session_meta","payload":{"id":"thread-4"}}"#,
+        #"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        #"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"swift test\"}"}}"#,
+        #"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"{\"cmd\":\"git status\"}"}}"#
+    ]
+
+    let session = try #require(CodexSessionReader.parse(lines: lines, fallbackID: "fallback"))
+    #expect(session.activity == "Ejecutando comando")
+    #expect(session.output == "$ git status")
 }
