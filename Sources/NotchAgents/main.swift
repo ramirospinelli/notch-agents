@@ -32,6 +32,19 @@ func shouldPlayCompletionSound(preference: Bool?) -> Bool {
     preference ?? true
 }
 
+func shouldExpandOnHover(preference: Bool?) -> Bool {
+    preference ?? true
+}
+
+func notificationWarning(_ status: UNAuthorizationStatus) -> String? {
+    switch status {
+    case .denied: "NOTIFICACIONES BLOQUEADAS"
+    case .notDetermined: "NOTIFICACIONES PENDIENTES"
+    case .authorized, .provisional, .ephemeral: nil
+    @unknown default: nil
+    }
+}
+
 func sessionPriority(_ session: CodexSession) -> Int {
     if session.needsAttention { return 0 }
     if session.hasFailed { return 1 }
@@ -56,6 +69,7 @@ struct NotchAgentsApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @AppStorage("showsTaskContent") private var showsTaskContent = false
     @AppStorage("playsCompletionSound") private var playsCompletionSound = true
+    @AppStorage("expandsOnHover") private var expandsOnHover = true
     @State private var startsAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some Scene {
@@ -64,6 +78,7 @@ struct NotchAgentsApp: App {
             Button("Actualizar ahora") { delegate.monitor.refresh() }
             Toggle("Mostrar contenido de tareas", isOn: $showsTaskContent)
             Toggle("Sonido suave al terminar", isOn: $playsCompletionSound)
+            Toggle("Expandir al pasar el cursor", isOn: $expandsOnHover)
             Toggle("Abrir al iniciar sesión", isOn: $startsAtLogin)
                 .onChange(of: startsAtLogin) { _, enabled in
                     if !delegate.setLaunchAtLogin(enabled) {
@@ -84,6 +99,7 @@ final class AgentMonitor: ObservableObject {
     @Published private(set) var unreadCompletedSessionIDs = Set<String>()
     @Published private(set) var unreadFailedSessionIDs = Set<String>()
     @Published private(set) var appServerConnected = false
+    @Published private(set) var notificationAuthorizationStatus: UNAuthorizationStatus = .notDetermined
     @Published var isExpanded = false
     var onSessionCompleted: ((CodexSession) -> Void)?
     var onSessionFailed: ((CodexSession) -> Void)?
@@ -218,6 +234,10 @@ final class AgentMonitor: ObservableObject {
             app.activate()
         }
     }
+
+    func updateNotificationAuthorizationStatus(_ status: UNAuthorizationStatus) {
+        notificationAuthorizationStatus = status
+    }
 }
 
 @MainActor
@@ -237,7 +257,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         UserDefaults.standard.register(defaults: ["playsCompletionSound": true])
         let notifications = UNUserNotificationCenter.current()
         notifications.delegate = self
-        notifications.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        notifications.requestAuthorization(options: [.alert, .sound]) { [weak self] _, _ in
+            Task { @MainActor [weak self] in self?.refreshNotificationAuthorizationStatus() }
+        }
+        refreshNotificationAuthorizationStatus()
         monitor.onSessionCompleted = { [weak self] session in self?.notifyCompletion(session) }
         monitor.onSessionFailed = { [weak self] session in self?.notifyFailure(session) }
         monitor.onAttentionNeeded = { [weak self] session in
@@ -302,10 +325,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private func handleHover(_ hovering: Bool) {
         hoverExpansion?.cancel()
-        guard hovering, !monitor.isExpanded else { return }
+        let preference = UserDefaults.standard.object(forKey: "expandsOnHover") as? Bool
+        guard hovering, !monitor.isExpanded, shouldExpandOnHover(preference: preference) else { return }
         let expansion = DispatchWorkItem { [weak self] in self?.setExpanded(true) }
         hoverExpansion = expansion
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: expansion)
+    }
+
+    private func refreshNotificationAuthorizationStatus() {
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            let status = settings.authorizationStatus
+            Task { @MainActor [weak self] in
+                self?.monitor.updateNotificationAuthorizationStatus(status)
+            }
+        }
     }
 
     private func makePanel() -> NSPanel {
@@ -506,14 +539,31 @@ struct NotchView: View {
             }
 
             HStack(spacing: 5) {
-                Circle()
-                    .fill(monitor.appServerConnected ? Color.green : Color.white.opacity(0.3))
-                    .frame(width: 6, height: 6)
-                Text(monitor.appServerConnected ? "TIEMPO REAL" : "MONITOREO LOCAL")
-                    .font(.system(size: 8, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.4))
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(monitor.appServerConnected ? Color.green : Color.white.opacity(0.3))
+                        .frame(width: 6, height: 6)
+                    Text(monitor.appServerConnected ? "TIEMPO REAL" : "MONITOREO LOCAL")
+                        .font(.system(size: 8, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.4))
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(monitor.appServerConnected ? "Monitor en tiempo real conectado" : "Monitor local activo")
+                Spacer()
+                if let warning = notificationWarning(monitor.notificationAuthorizationStatus) {
+                    Button {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    } label: {
+                        Text(warning)
+                            .font(.system(size: 8, weight: .bold, design: .rounded))
+                            .foregroundStyle(Color.orange)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Abrir configuración de notificaciones")
+                }
             }
-            .accessibilityLabel(monitor.appServerConnected ? "Monitor en tiempo real conectado" : "Monitor local activo")
         }
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)

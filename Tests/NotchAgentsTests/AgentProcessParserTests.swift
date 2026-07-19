@@ -47,6 +47,14 @@ import AppKit
     #expect(!shouldPlayCompletionSound(preference: false))
 }
 
+@Test func keepsHoverOptionalAndExplainsNotificationState() {
+    #expect(shouldExpandOnHover(preference: nil))
+    #expect(shouldExpandOnHover(preference: true))
+    #expect(!shouldExpandOnHover(preference: false))
+    #expect(notificationWarning(.denied) == "NOTIFICACIONES BLOQUEADAS")
+    #expect(notificationWarning(.authorized) == nil)
+}
+
 @Test func readsCodexAppServerAttentionStates() throws {
     let approval = try #require(CodexAppServerEvent.parse(#"{"method":"thread/status/changed","params":{"threadId":"thread-1","status":{"type":"active","activeFlags":["waitingOnApproval"]}}}"#))
     let question = try #require(CodexAppServerEvent.parse(#"{"method":"thread/started","params":{"thread":{"id":"thread-2","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}}}"#))
