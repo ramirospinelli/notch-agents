@@ -50,6 +50,14 @@ struct CodexRateLimit: Equatable, Sendable {
 }
 
 enum CodexSessionReader {
+    private struct CachedSession {
+        let modifiedAt: Date
+        let fileSize: Int
+        let session: CodexSession?
+    }
+
+    private static let cacheLock = NSLock()
+    private nonisolated(unsafe) static var cache: [URL: CachedSession] = [:]
     private static let ignoredUserPrefixes = [
         "<environment_context>", "<recommended_plugins>", "# AGENTS.md", "<permissions instructions>",
         "The following is the Codex agent history"
@@ -59,18 +67,42 @@ enum CodexSessionReader {
         let root = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".codex/sessions")
         guard let files = FileManager.default.enumerator(
             at: root,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey]
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
         )?.compactMap({ $0 as? URL }).filter({ $0.pathExtension == "jsonl" }) else { return [] }
 
-        return files.compactMap { url -> (URL, Date)? in
-            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
-                  let date = values.contentModificationDate else { return nil }
-            return (url, date)
+        let selected = files.compactMap { url -> (URL, Date, Int)? in
+            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
+                  let date = values.contentModificationDate,
+                  let size = values.fileSize else { return nil }
+            return (url, date, size)
         }
         .sorted { $0.1 > $1.1 }
         .prefix(limit)
-        .compactMap { url, date in parseFile(url, modifiedAt: date) }
+
+        let selectedURLs = Set(selected.map(\.0))
+        cacheLock.withLock { cache = cache.filter { selectedURLs.contains($0.key) } }
+
+        return selected.compactMap { url, date, size in cachedSession(for: url, modifiedAt: date, fileSize: size) }
         .filter { $0.title != "Sesión Codex" || $0.isRunning || $0.needsAttention || $0.hasFailed }
+    }
+
+    static func canReuseCache(cachedModifiedAt: Date, cachedFileSize: Int, modifiedAt: Date, fileSize: Int) -> Bool {
+        cachedModifiedAt == modifiedAt && cachedFileSize == fileSize
+    }
+
+    private static func cachedSession(for url: URL, modifiedAt: Date, fileSize: Int) -> CodexSession? {
+        if let cached = cacheLock.withLock({ cache[url] }),
+           canReuseCache(
+               cachedModifiedAt: cached.modifiedAt,
+               cachedFileSize: cached.fileSize,
+               modifiedAt: modifiedAt,
+               fileSize: fileSize
+           ) {
+            return cached.session
+        }
+        let session = parseFile(url, modifiedAt: modifiedAt)
+        cacheLock.withLock { cache[url] = CachedSession(modifiedAt: modifiedAt, fileSize: fileSize, session: session) }
+        return session
     }
 
     static func parse(lines: [String], fallbackID: String, modifiedAt: Date = .now) -> CodexSession? {

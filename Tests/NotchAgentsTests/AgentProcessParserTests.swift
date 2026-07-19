@@ -35,6 +35,14 @@ import AppKit
     #expect(refreshInterval(hasActiveSessions: false) == 10)
 }
 
+@Test func reusesParsedSessionsOnlyWhileTheFileSnapshotMatches() {
+    let date = Date(timeIntervalSince1970: 100)
+
+    #expect(CodexSessionReader.canReuseCache(cachedModifiedAt: date, cachedFileSize: 42, modifiedAt: date, fileSize: 42))
+    #expect(!CodexSessionReader.canReuseCache(cachedModifiedAt: date, cachedFileSize: 42, modifiedAt: date, fileSize: 43))
+    #expect(!CodexSessionReader.canReuseCache(cachedModifiedAt: date, cachedFileSize: 42, modifiedAt: date.addingTimeInterval(1), fileSize: 42))
+}
+
 @Test func stopsMascotAnimationWhenReducedMotionIsEnabled() {
     #expect(shouldAnimateMascot(isProcessing: true, reduceMotion: false))
     #expect(!shouldAnimateMascot(isProcessing: false, reduceMotion: false))

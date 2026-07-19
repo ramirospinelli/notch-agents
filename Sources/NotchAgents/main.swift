@@ -109,6 +109,7 @@ final class AgentMonitor: ObservableObject {
     private var liveStates: [String: CodexLiveState] = [:]
     private var appServerClient: CodexAppServerClient?
     private var appServerRestart: DispatchWorkItem?
+    private var refreshInFlight = false
 
     init() {
         scheduleRefresh(every: 2)
@@ -125,15 +126,19 @@ final class AgentMonitor: ObservableObject {
     }
 
     func refresh() {
+        guard !refreshInFlight else { return }
+        refreshInFlight = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let agents = Self.runningAgents()
             let sessions = CodexSessionReader.latest()
-            DispatchQueue.main.async {
-                let previouslyRunning = Set(self?.sessions.filter(\.isRunning).map(\.id) ?? [])
-                let previouslyWaiting = Set(self?.sessions.filter(\.needsAttention).map(\.id) ?? [])
-                self?.agents = agents
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                defer { self.refreshInFlight = false }
+                let previouslyRunning = Set(self.sessions.filter(\.isRunning).map(\.id))
+                let previouslyWaiting = Set(self.sessions.filter(\.needsAttention).map(\.id))
+                self.agents = agents
                 let currentSessions = sessions.map { session in
-                    guard let liveState = self?.liveStates[session.id] else { return session }
+                    guard let liveState = self.liveStates[session.id] else { return session }
                     return session.applying(liveState)
                 }
                 let sorted = currentSessions.sorted {
@@ -141,27 +146,23 @@ final class AgentMonitor: ObservableObject {
                     let rhs = sessionPriority($1)
                     return lhs == rhs ? $0.updatedAt > $1.updatedAt : lhs < rhs
                 }
-                self?.sessions = sorted
+                self.sessions = sorted
                 let completedIDs = newlyCompletedSessionIDs(previouslyRunning: previouslyRunning, sessions: sorted)
-                if let unread = self?.unreadCompletedSessionIDs {
-                    self?.unreadCompletedSessionIDs = visibleUnreadSessionIDs(unread, sessions: sorted)
-                }
-                self?.unreadCompletedSessionIDs.formUnion(completedIDs)
+                self.unreadCompletedSessionIDs = visibleUnreadSessionIDs(self.unreadCompletedSessionIDs, sessions: sorted)
+                self.unreadCompletedSessionIDs.formUnion(completedIDs)
                 for session in sorted where completedIDs.contains(session.id) {
-                    self?.onSessionCompleted?(session)
+                    self.onSessionCompleted?(session)
                 }
                 let failedIDs = newlyFailedSessionIDs(previouslyRunning: previouslyRunning, sessions: sorted)
-                if let unread = self?.unreadFailedSessionIDs {
-                    self?.unreadFailedSessionIDs = unread.intersection(sorted.lazy.filter(\.hasFailed).map(\.id))
-                }
-                self?.unreadFailedSessionIDs.formUnion(failedIDs)
+                self.unreadFailedSessionIDs = self.unreadFailedSessionIDs.intersection(sorted.lazy.filter(\.hasFailed).map(\.id))
+                self.unreadFailedSessionIDs.formUnion(failedIDs)
                 for session in sorted where failedIDs.contains(session.id) {
-                    self?.onSessionFailed?(session)
+                    self.onSessionFailed?(session)
                 }
                 for session in sorted where session.needsAttention && !previouslyWaiting.contains(session.id) {
-                    self?.onAttentionNeeded?(session)
+                    self.onAttentionNeeded?(session)
                 }
-                self?.scheduleRefresh(every: refreshInterval(hasActiveSessions: sorted.contains(where: \.isRunning)))
+                self.scheduleRefresh(every: refreshInterval(hasActiveSessions: sorted.contains(where: \.isRunning)))
             }
         }
     }
