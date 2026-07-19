@@ -1,0 +1,424 @@
+import AppKit
+import SwiftUI
+import UserNotifications
+
+func notchPanelFrame(screen: NSRect, notchWidth: CGFloat?, notchHeight: CGFloat, expanded: Bool) -> NSRect {
+    let size = expanded
+        ? NSSize(width: 510, height: 390)
+        : NSSize(width: max(280, (notchWidth ?? 124) + 156), height: notchHeight > 0 ? notchHeight : 32)
+    return NSRect(x: screen.midX - size.width / 2, y: screen.maxY - size.height, width: size.width, height: size.height)
+}
+
+func compactLimitLabel(_ usage: CodexUsage?) -> String {
+    guard let limit = [usage?.primary, usage?.secondary].compactMap({ $0 }).max(by: { $0.windowMinutes < $1.windowMinutes }) else { return "—" }
+    let window = limit.windowMinutes >= 1_440 ? "\(limit.windowMinutes / 1_440)D" : "\(limit.windowMinutes / 60)H"
+    return "\(window) \(Int(limit.usedPercent.rounded()))%"
+}
+
+func shouldCollapsePanel(expanded: Bool, panelFrame: NSRect, clickLocation: NSPoint) -> Bool {
+    expanded && !panelFrame.contains(clickLocation)
+}
+
+@main
+struct NotchAgentsApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
+
+    var body: some Scene {
+        MenuBarExtra("Notch Agents", systemImage: "sparkles") {
+            Button("Mostrar agentes") { delegate.showPanel(expanded: true) }
+            Button("Actualizar ahora") { delegate.monitor.refresh() }
+            Divider()
+            Button("Salir") { NSApplication.shared.terminate(nil) }
+        }
+        .menuBarExtraStyle(.menu)
+    }
+}
+
+@MainActor
+final class AgentMonitor: ObservableObject {
+    @Published private(set) var agents: [AgentProcess] = []
+    @Published private(set) var sessions: [CodexSession] = []
+    @Published var isExpanded = false
+    var onSessionCompleted: ((CodexSession) -> Void)?
+    private var timer: Timer?
+
+    init() {
+        refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+    }
+
+    func refresh() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let agents = Self.runningAgents()
+            let sessions = CodexSessionReader.latest()
+            DispatchQueue.main.async {
+                let previouslyRunning = Set(self?.sessions.filter(\.isRunning).map(\.id) ?? [])
+                self?.agents = agents
+                let sorted = sessions.sorted { $0.isRunning && !$1.isRunning }
+                self?.sessions = sorted
+                for session in sorted where previouslyRunning.contains(session.id) && !session.isRunning {
+                    self?.onSessionCompleted?(session)
+                }
+            }
+        }
+    }
+
+    nonisolated private static func runningAgents() -> [AgentProcess] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-axo", "pid=,command="]
+        let output = Pipe()
+        process.standardOutput = output
+        do {
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return AgentProcessParser.parse(String(decoding: data, as: UTF8.self))
+        } catch {
+            return []
+        }
+    }
+
+    func openThread(_ session: CodexSession) {
+        if NSWorkspace.shared.open(session.deepLink) { return }
+        let apps = NSWorkspace.shared.runningApplications
+        if let app = apps.first(where: {
+            let name = $0.localizedName ?? ""
+            return name.localizedCaseInsensitiveContains("codex") || name.localizedCaseInsensitiveContains("chatgpt")
+        }) {
+            app.activate()
+        }
+    }
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    let monitor = AgentMonitor()
+    private var panel: NSPanel?
+    private var globalClickMonitor: Any?
+    private var localClickMonitor: Any?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let notifications = UNUserNotificationCenter.current()
+        notifications.delegate = self
+        notifications.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        monitor.onSessionCompleted = { [weak self] session in self?.notifyCompletion(session) }
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.collapseIfNeeded() }
+        }
+        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            self?.collapseIfNeeded()
+            return event
+        }
+        showPanel()
+        monitor.refresh()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let globalClickMonitor { NSEvent.removeMonitor(globalClickMonitor) }
+        if let localClickMonitor { NSEvent.removeMonitor(localClickMonitor) }
+    }
+
+    func showPanel(expanded: Bool? = nil) {
+        if let expanded { monitor.isExpanded = expanded }
+        if panel == nil { panel = makePanel() }
+        resize(panel!, animated: false)
+        panel?.orderFrontRegardless()
+    }
+
+    func togglePanel() {
+        setExpanded(!monitor.isExpanded)
+    }
+
+    private func setExpanded(_ expanded: Bool) {
+        guard monitor.isExpanded != expanded else { return }
+        monitor.isExpanded = expanded
+        guard let panel else { return }
+        resize(panel, animated: true)
+    }
+
+    private func collapseIfNeeded() {
+        guard let panel, shouldCollapsePanel(expanded: monitor.isExpanded, panelFrame: panel.frame, clickLocation: NSEvent.mouseLocation) else { return }
+        setExpanded(false)
+    }
+
+    private func makePanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 220, height: 38),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isFloatingPanel = true
+        panel.level = .statusBar
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.hidesOnDeactivate = false
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.contentView = NSHostingView(rootView: NotchView(monitor: monitor, onToggle: { [weak self] in self?.togglePanel() }))
+        return panel
+    }
+
+    private func resize(_ panel: NSPanel, animated: Bool) {
+        guard let screen = NSScreen.main else { return }
+        let notchWidth = screen.auxiliaryTopLeftArea.flatMap { left in
+            screen.auxiliaryTopRightArea.map { $0.minX - left.maxX }
+        }
+        panel.setFrame(notchPanelFrame(
+            screen: screen.frame,
+            notchWidth: notchWidth,
+            notchHeight: screen.safeAreaInsets.top,
+            expanded: monitor.isExpanded
+        ), display: true, animate: animated)
+    }
+
+    private func notifyCompletion(_ session: CodexSession) {
+        let content = UNMutableNotificationContent()
+        content.title = "Codex terminó"
+        content.body = session.title
+        content.sound = .default
+        content.userInfo = ["threadId": session.id]
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "codex-finished-\(session.id)", content: content, trigger: nil)
+        )
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        if let id = response.notification.request.content.userInfo["threadId"] as? String,
+           let url = URL(string: "codex://threads/\(id)") {
+            DispatchQueue.main.async { NSWorkspace.shared.open(url) }
+        }
+        completionHandler()
+    }
+}
+
+struct NotchView: View {
+    @ObservedObject var monitor: AgentMonitor
+    let onToggle: () -> Void
+
+    var body: some View {
+        Group {
+            if monitor.isExpanded {
+                expandedView
+            } else {
+                Button(action: onToggle) {
+                    HStack(spacing: 8) {
+                        RetroMascot(isProcessing: isProcessing)
+                        Spacer()
+                        Text(compactLimitLabel(activeUsage))
+                            .font(.system(size: 9, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.7))
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.45))
+                    }
+                    .padding(.horizontal, 14)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .foregroundStyle(.white)
+        .background(Color.black, in: UnevenRoundedRectangle(
+            topLeadingRadius: 0,
+            bottomLeadingRadius: monitor.isExpanded ? 28 : 0,
+            bottomTrailingRadius: monitor.isExpanded ? 28 : 0,
+            topTrailingRadius: 0,
+            style: .continuous
+        ))
+    }
+
+    private var expandedView: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Button(action: onToggle) {
+                HStack {
+                    RetroMascot(isProcessing: isProcessing)
+                    Spacer()
+                    Text(statusText)
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(monitor.sessions.contains(where: \.isRunning) ? Color.green : Color.white.opacity(0.55))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Color.white.opacity(0.08), in: Capsule())
+                    Image(systemName: "chevron.up")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.55))
+                        .padding(7)
+                        .background(Color.white.opacity(0.08), in: Circle())
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if let usage = activeUsage {
+                UsageStrip(usage: usage)
+            }
+
+            if monitor.sessions.isEmpty {
+                Spacer()
+                VStack(spacing: 8) {
+                    Image(systemName: monitor.agents.isEmpty ? "moon.zzz" : "terminal")
+                        .font(.system(size: 24))
+                    Text(monitor.agents.isEmpty ? "Codex no está ejecutándose" : "Codex activo · esperando una tarea")
+                        .font(.system(size: 14, weight: .medium, design: .rounded))
+                    Text("El panel se actualiza automáticamente.")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.45))
+                }
+                .frame(maxWidth: .infinity)
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(monitor.sessions) { session in
+                            Button { monitor.openThread(session) } label: {
+                                SessionCard(session: session)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .scrollIndicators(.hidden)
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var statusText: String {
+        let running = monitor.sessions.filter(\.isRunning).count
+        if running > 0 { return "\(running) CORRIENDO" }
+        return monitor.agents.isEmpty ? "INACTIVO" : "EN ESPERA"
+    }
+
+    private var activeUsage: CodexUsage? {
+        monitor.sessions.first(where: \.isRunning)?.usage ?? monitor.sessions.compactMap(\.usage).first
+    }
+
+    private var isProcessing: Bool { monitor.sessions.contains(where: \.isRunning) }
+}
+
+private struct RetroMascot: View {
+    let isProcessing: Bool
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 0.25, paused: !isProcessing)) { timeline in
+            let alternate = Int(timeline.date.timeIntervalSinceReferenceDate * 4).isMultiple(of: 2)
+            Text(isProcessing ? (alternate ? "▟•ᴗ•▙" : "▙•ᴗ•▟") : "▟-ᴗ-▙")
+                .font(.system(size: 9, weight: .black, design: .monospaced))
+                .foregroundStyle(isProcessing ? Color.green : Color.white.opacity(0.4))
+                .offset(y: isProcessing && alternate ? -1 : 0)
+        }
+        .accessibilityLabel(isProcessing ? "Mascota procesando" : "Mascota en espera")
+    }
+}
+
+private struct UsageStrip: View {
+    let usage: CodexUsage
+
+    var body: some View {
+        HStack(spacing: 8) {
+            UsageMeter(label: "CONTEXTO", value: usage.contextPercent, detail: "\(short(usage.contextTokens))/\(short(usage.contextWindow))")
+            if let primary = usage.primary {
+                UsageMeter(label: windowLabel(primary.windowMinutes), value: primary.usedPercent, detail: resetLabel(primary.resetsAt))
+            }
+            if let secondary = usage.secondary {
+                UsageMeter(label: windowLabel(secondary.windowMinutes), value: secondary.usedPercent, detail: resetLabel(secondary.resetsAt))
+            }
+        }
+    }
+
+    private func short(_ value: Int) -> String {
+        value >= 1_000 ? String(format: "%.0fk", Double(value) / 1_000) : "\(value)"
+    }
+
+    private func windowLabel(_ minutes: Int) -> String {
+        minutes >= 1_440 ? "LÍMITE \(minutes / 1_440)D" : "LÍMITE \(minutes / 60)H"
+    }
+
+    private func resetLabel(_ date: Date?) -> String {
+        guard let date else { return "actual" }
+        return RelativeDateTimeFormatter().localizedString(for: date, relativeTo: .now)
+    }
+}
+
+private struct UsageMeter: View {
+    let label: String
+    let value: Double
+    let detail: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(label).font(.system(size: 9, weight: .bold, design: .rounded))
+                Spacer()
+                Text("\(Int(value.rounded()))%").font(.system(size: 10, weight: .bold, design: .monospaced))
+            }
+            ProgressView(value: value, total: 100).tint(value >= 85 ? .orange : .green)
+            Text(detail).font(.system(size: 9, design: .rounded)).foregroundStyle(.white.opacity(0.4)).lineLimit(1)
+        }
+        .padding(9)
+        .frame(maxWidth: .infinity)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+private struct SessionCard: View {
+    let session: CodexSession
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: session.isRunning ? "waveform" : "checkmark.circle.fill")
+                    .foregroundStyle(session.isRunning ? Color.green : Color.white.opacity(0.4))
+                Text(session.title)
+                    .font(.system(size: 14, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+                Spacer()
+                Text(session.project.uppercased())
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.38))
+            }
+            HStack(spacing: 6) {
+                if session.isRunning {
+                    ProgressView().controlSize(.mini).tint(.green).accessibilityHidden(true)
+                }
+                Text(session.activity)
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(session.isRunning ? Color.green : Color.white.opacity(0.45))
+            }
+            Text(session.output)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.7))
+                .lineLimit(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(12)
+        .background(Color.white.opacity(session.isRunning ? 0.09 : 0.055), in: RoundedRectangle(cornerRadius: 14))
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(session.isRunning ? Color.green : Color.clear)
+                .frame(width: 3)
+                .padding(.vertical, 12)
+        }
+    }
+}
