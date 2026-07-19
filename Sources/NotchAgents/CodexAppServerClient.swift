@@ -71,15 +71,18 @@ struct CodexAppServerEvent: Equatable, Sendable {
 
 final class CodexAppServerClient: @unchecked Sendable {
     var onEvent: (@Sendable (CodexAppServerEvent) -> Void)?
+    var onStarted: (@Sendable () -> Void)?
+    var onExit: (@Sendable (_ usedProxy: Bool) -> Void)?
 
     private let executableURL: URL
     private let socketPath: String?
+    private let prefersSocket: Bool
     private let queue = DispatchQueue(label: "local.notchagents.codex-app-server")
     private var process: Process?
     private var input: FileHandle?
     private var buffer = Data()
 
-    init?(fileManager: FileManager = .default) {
+    init?(fileManager: FileManager = .default, prefersSocket: Bool = true) {
         let candidates = [
             "/Applications/Codex.app/Contents/Resources/codex",
             "/Applications/ChatGPT.app/Contents/Resources/codex",
@@ -89,10 +92,11 @@ final class CodexAppServerClient: @unchecked Sendable {
         executableURL = URL(fileURLWithPath: path)
         let ipcSocketPath = NSHomeDirectory() + "/.codex/ipc/ipc.sock"
         socketPath = fileManager.fileExists(atPath: ipcSocketPath) ? ipcSocketPath : nil
+        self.prefersSocket = prefersSocket
     }
 
-    static func launchArguments(socketPath: String?) -> [String] {
-        guard let socketPath else { return ["app-server", "--listen", "stdio://"] }
+    static func launchArguments(socketPath: String?, prefersSocket: Bool = true) -> [String] {
+        guard prefersSocket, let socketPath else { return ["app-server", "--listen", "stdio://"] }
         return ["app-server", "proxy", "--sock", socketPath]
     }
 
@@ -101,7 +105,8 @@ final class CodexAppServerClient: @unchecked Sendable {
 
         let process = Process()
         process.executableURL = executableURL
-        process.arguments = Self.launchArguments(socketPath: socketPath)
+        let usesProxy = prefersSocket && socketPath != nil
+        process.arguments = Self.launchArguments(socketPath: socketPath, prefersSocket: prefersSocket)
         let output = Pipe()
         let input = Pipe()
         process.standardOutput = output
@@ -118,6 +123,7 @@ final class CodexAppServerClient: @unchecked Sendable {
             self.queue.async { [weak self] in
                 self?.process = nil
                 self?.input = nil
+                DispatchQueue.main.async { [weak self] in self?.onExit?(usesProxy) }
             }
         }
 
@@ -126,8 +132,13 @@ final class CodexAppServerClient: @unchecked Sendable {
             self.process = process
             self.input = input.fileHandleForWriting
             try sendInitialize()
+            DispatchQueue.main.async { [weak self] in self?.onStarted?() }
         } catch {
-            process.terminate()
+            if process.isRunning {
+                process.terminate()
+            } else {
+                DispatchQueue.main.async { [weak self] in self?.onExit?(usesProxy) }
+            }
         }
     }
 

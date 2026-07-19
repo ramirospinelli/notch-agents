@@ -32,6 +32,25 @@ func shouldPlayCompletionSound(preference: Bool?) -> Bool {
     preference ?? true
 }
 
+func sessionPriority(_ session: CodexSession) -> Int {
+    if session.needsAttention { return 0 }
+    if session.hasFailed { return 1 }
+    if session.isRunning { return 2 }
+    return 3
+}
+
+func newlyCompletedSessionIDs(previouslyRunning: Set<String>, sessions: [CodexSession]) -> Set<String> {
+    Set(sessions.lazy.filter { previouslyRunning.contains($0.id) && $0.activity == "Completado" }.map(\.id))
+}
+
+func newlyFailedSessionIDs(previouslyRunning: Set<String>, sessions: [CodexSession]) -> Set<String> {
+    Set(sessions.lazy.filter { previouslyRunning.contains($0.id) && $0.hasFailed }.map(\.id))
+}
+
+func visibleUnreadSessionIDs(_ unread: Set<String>, sessions: [CodexSession]) -> Set<String> {
+    unread.intersection(sessions.lazy.filter { !$0.isRunning }.map(\.id))
+}
+
 @main
 struct NotchAgentsApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
@@ -62,15 +81,20 @@ struct NotchAgentsApp: App {
 final class AgentMonitor: ObservableObject {
     @Published private(set) var agents: [AgentProcess] = []
     @Published private(set) var sessions: [CodexSession] = []
+    @Published private(set) var unreadCompletedSessionIDs = Set<String>()
+    @Published private(set) var unreadFailedSessionIDs = Set<String>()
+    @Published private(set) var appServerConnected = false
     @Published var isExpanded = false
     var onSessionCompleted: ((CodexSession) -> Void)?
+    var onSessionFailed: ((CodexSession) -> Void)?
+    var onAttentionNeeded: ((CodexSession) -> Void)?
     private var timer: Timer?
     private var timerInterval: TimeInterval?
     private var liveStates: [String: CodexLiveState] = [:]
     private var appServerClient: CodexAppServerClient?
+    private var appServerRestart: DispatchWorkItem?
 
     init() {
-        refresh()
         scheduleRefresh(every: 2)
         startAppServer()
     }
@@ -90,23 +114,44 @@ final class AgentMonitor: ObservableObject {
             let sessions = CodexSessionReader.latest()
             DispatchQueue.main.async {
                 let previouslyRunning = Set(self?.sessions.filter(\.isRunning).map(\.id) ?? [])
+                let previouslyWaiting = Set(self?.sessions.filter(\.needsAttention).map(\.id) ?? [])
                 self?.agents = agents
                 let currentSessions = sessions.map { session in
                     guard let liveState = self?.liveStates[session.id] else { return session }
                     return session.applying(liveState)
                 }
-                let sorted = currentSessions.sorted { $0.isRunning && !$1.isRunning }
+                let sorted = currentSessions.sorted {
+                    let lhs = sessionPriority($0)
+                    let rhs = sessionPriority($1)
+                    return lhs == rhs ? $0.updatedAt > $1.updatedAt : lhs < rhs
+                }
                 self?.sessions = sorted
-                for session in sorted where previouslyRunning.contains(session.id) && !session.isRunning {
+                let completedIDs = newlyCompletedSessionIDs(previouslyRunning: previouslyRunning, sessions: sorted)
+                if let unread = self?.unreadCompletedSessionIDs {
+                    self?.unreadCompletedSessionIDs = visibleUnreadSessionIDs(unread, sessions: sorted)
+                }
+                self?.unreadCompletedSessionIDs.formUnion(completedIDs)
+                for session in sorted where completedIDs.contains(session.id) {
                     self?.onSessionCompleted?(session)
+                }
+                let failedIDs = newlyFailedSessionIDs(previouslyRunning: previouslyRunning, sessions: sorted)
+                if let unread = self?.unreadFailedSessionIDs {
+                    self?.unreadFailedSessionIDs = unread.intersection(sorted.lazy.filter(\.hasFailed).map(\.id))
+                }
+                self?.unreadFailedSessionIDs.formUnion(failedIDs)
+                for session in sorted where failedIDs.contains(session.id) {
+                    self?.onSessionFailed?(session)
+                }
+                for session in sorted where session.needsAttention && !previouslyWaiting.contains(session.id) {
+                    self?.onAttentionNeeded?(session)
                 }
                 self?.scheduleRefresh(every: refreshInterval(hasActiveSessions: sorted.contains(where: \.isRunning)))
             }
         }
     }
 
-    private func startAppServer() {
-        guard let client = CodexAppServerClient() else { return }
+    private func startAppServer(prefersSocket: Bool = true) {
+        guard let client = CodexAppServerClient(prefersSocket: prefersSocket) else { return }
         client.onEvent = { [weak self] event in
             Task { @MainActor [weak self] in
                 if event.state == .idle {
@@ -117,8 +162,32 @@ final class AgentMonitor: ObservableObject {
                 self?.refresh()
             }
         }
-        client.start()
+        client.onStarted = { [weak self, weak client] in
+            Task { @MainActor [weak self, weak client] in
+                guard let self, let client, self.appServerClient === client else { return }
+                self.appServerRestart?.cancel()
+                self.appServerConnected = true
+            }
+        }
+        client.onExit = { [weak self, weak client] _ in
+            Task { @MainActor [weak self, weak client] in
+                guard let self, let client, self.appServerClient === client else { return }
+                self.appServerConnected = false
+                self.appServerClient = nil
+                self.liveStates.removeAll()
+                self.refresh()
+                self.scheduleAppServerRestart(prefersSocket: false)
+            }
+        }
         appServerClient = client
+        client.start()
+    }
+
+    private func scheduleAppServerRestart(prefersSocket: Bool) {
+        appServerRestart?.cancel()
+        let restart = DispatchWorkItem { [weak self] in self?.startAppServer(prefersSocket: prefersSocket) }
+        appServerRestart = restart
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: restart)
     }
 
     nonisolated private static func runningAgents() -> [AgentProcess] {
@@ -138,6 +207,8 @@ final class AgentMonitor: ObservableObject {
     }
 
     func openThread(_ session: CodexSession) {
+        unreadCompletedSessionIDs.remove(session.id)
+        unreadFailedSessionIDs.remove(session.id)
         if NSWorkspace.shared.open(session.deepLink) { return }
         let apps = NSWorkspace.shared.runningApplications
         if let app = apps.first(where: {
@@ -167,6 +238,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         notifications.delegate = self
         notifications.requestAuthorization(options: [.alert, .sound]) { _, _ in }
         monitor.onSessionCompleted = { [weak self] session in self?.notifyCompletion(session) }
+        monitor.onSessionFailed = { [weak self] session in self?.notifyFailure(session) }
+        monitor.onAttentionNeeded = { [weak self] session in
+            self?.setExpanded(true)
+            self?.notifyAttention(session)
+        }
         globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
             Task { @MainActor [weak self] in self?.collapseIfNeeded() }
         }
@@ -271,6 +347,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         )
     }
 
+    private func notifyAttention(_ session: CodexSession) {
+        let content = UNMutableNotificationContent()
+        content.title = session.activity
+        content.body = UserDefaults.standard.bool(forKey: "showsTaskContent") ? session.title : "Codex necesita que intervengas"
+        content.userInfo = ["threadId": session.id]
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "codex-attention-\(session.id)", content: content, trigger: nil)
+        )
+    }
+
+    private func notifyFailure(_ session: CodexSession) {
+        let content = UNMutableNotificationContent()
+        content.title = session.activity == "Interrumpido" ? "Codex se interrumpió" : "Codex falló"
+        content.body = UserDefaults.standard.bool(forKey: "showsTaskContent") ? session.output : "Una tarea requiere revisión"
+        content.userInfo = ["threadId": session.id]
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "codex-failed-\(session.id)", content: content, trigger: nil)
+        )
+    }
+
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
@@ -306,12 +402,12 @@ struct NotchView: View {
                     HStack(spacing: 8) {
                         RetroMascot(isProcessing: isProcessing)
                         Spacer()
-                        Text(compactLimitLabel(activeUsage))
+                        Text(compactStatusText)
                             .font(.system(size: 9, weight: .bold, design: .rounded))
-                            .foregroundStyle(.white.opacity(0.7))
-                        Image(systemName: "chevron.down")
+                            .foregroundStyle(compactStatusColor)
+                        Image(systemName: compactStatusIcon)
                             .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(.white.opacity(0.45))
+                            .foregroundStyle(compactStatusColor)
                     }
                     .padding(.horizontal, 14)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -339,7 +435,7 @@ struct NotchView: View {
                     Spacer()
                     Text(statusText)
                         .font(.system(size: 11, weight: .semibold, design: .rounded))
-                        .foregroundStyle(monitor.sessions.contains(where: \.isRunning) ? Color.green : Color.white.opacity(0.55))
+                        .foregroundStyle(statusColor)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
                         .background(Color.white.opacity(0.08), in: Capsule())
@@ -376,7 +472,11 @@ struct NotchView: View {
                     LazyVStack(spacing: 8) {
                         ForEach(monitor.sessions) { session in
                             Button { monitor.openThread(session) } label: {
-                                SessionCard(session: session, showsTaskContent: showsTaskContent)
+                                SessionCard(
+                                    session: session,
+                                    showsTaskContent: showsTaskContent,
+                                    isUnread: monitor.unreadCompletedSessionIDs.contains(session.id) || monitor.unreadFailedSessionIDs.contains(session.id)
+                                )
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel("Abrir \(showsTaskContent ? session.title : "tarea de Codex")")
@@ -385,12 +485,25 @@ struct NotchView: View {
                 }
                 .scrollIndicators(.hidden)
             }
+
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(monitor.appServerConnected ? Color.green : Color.white.opacity(0.3))
+                    .frame(width: 6, height: 6)
+                Text(monitor.appServerConnected ? "TIEMPO REAL" : "MONITOREO LOCAL")
+                    .font(.system(size: 8, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.4))
+            }
+            .accessibilityLabel(monitor.appServerConnected ? "Monitor en tiempo real conectado" : "Monitor local activo")
         }
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var statusText: String {
+        if attentionSession != nil { return "REQUIERE ATENCIÓN" }
+        if !monitor.unreadFailedSessionIDs.isEmpty { return "\(monitor.unreadFailedSessionIDs.count) FALLÓ" }
+        if !monitor.unreadCompletedSessionIDs.isEmpty { return "\(monitor.unreadCompletedSessionIDs.count) TERMINÓ" }
         let running = monitor.sessions.filter(\.isRunning).count
         if running > 0 { return "\(running) CORRIENDO" }
         return monitor.agents.isEmpty ? "INACTIVO" : "EN ESPERA"
@@ -398,6 +511,36 @@ struct NotchView: View {
 
     private var activeUsage: CodexUsage? {
         monitor.sessions.first(where: \.isRunning)?.usage ?? monitor.sessions.compactMap(\.usage).first
+    }
+
+    private var attentionSession: CodexSession? { monitor.sessions.first(where: \.needsAttention) }
+
+    private var compactStatusText: String {
+        if let attentionSession { return attentionSession.activity }
+        if !monitor.unreadFailedSessionIDs.isEmpty { return "\(monitor.unreadFailedSessionIDs.count) FALLÓ" }
+        if !monitor.unreadCompletedSessionIDs.isEmpty { return "\(monitor.unreadCompletedSessionIDs.count) TERMINÓ" }
+        return compactLimitLabel(activeUsage)
+    }
+
+    private var statusColor: Color {
+        if attentionSession != nil { return .orange }
+        if !monitor.unreadFailedSessionIDs.isEmpty { return .red }
+        if !monitor.unreadCompletedSessionIDs.isEmpty || monitor.sessions.contains(where: \.isRunning) { return .green }
+        return .white.opacity(0.55)
+    }
+
+    private var compactStatusIcon: String {
+        if attentionSession != nil { return "exclamationmark.circle.fill" }
+        if !monitor.unreadFailedSessionIDs.isEmpty { return "xmark.circle.fill" }
+        if !monitor.unreadCompletedSessionIDs.isEmpty { return "checkmark.circle.fill" }
+        return "chevron.down"
+    }
+
+    private var compactStatusColor: Color {
+        if attentionSession != nil { return .orange }
+        if !monitor.unreadFailedSessionIDs.isEmpty { return .red }
+        if !monitor.unreadCompletedSessionIDs.isEmpty { return .green }
+        return .white.opacity(0.7)
     }
 
     private var isProcessing: Bool { monitor.sessions.contains(where: \.isRunning) }
@@ -472,16 +615,23 @@ private struct UsageMeter: View {
 private struct SessionCard: View {
     let session: CodexSession
     let showsTaskContent: Bool
+    let isUnread: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Image(systemName: session.isRunning ? "waveform" : "checkmark.circle.fill")
-                    .foregroundStyle(session.needsAttention ? Color.orange : (session.isRunning ? Color.green : Color.white.opacity(0.4)))
+                Image(systemName: session.isRunning ? "waveform" : (session.hasFailed ? "xmark.circle.fill" : "checkmark.circle.fill"))
+                    .foregroundStyle(session.needsAttention ? Color.orange : (session.hasFailed ? Color.red : (session.isRunning ? Color.green : Color.white.opacity(0.4))))
                 Text(showsTaskContent ? session.title : "Tarea de Codex")
                     .font(.system(size: 14, weight: .semibold, design: .rounded))
                     .lineLimit(1)
                 Spacer()
+                if isUnread {
+                    Circle()
+                        .fill(session.hasFailed ? Color.red : Color.green)
+                        .frame(width: 6, height: 6)
+                        .accessibilityLabel("Sin leer")
+                }
                 Text(session.project.uppercased())
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.38))
@@ -492,7 +642,7 @@ private struct SessionCard: View {
                 }
                 Text(session.activity)
                     .font(.system(size: 11, weight: .medium, design: .rounded))
-                    .foregroundStyle(session.needsAttention ? Color.orange : (session.isRunning ? Color.green : Color.white.opacity(0.45)))
+                    .foregroundStyle(session.needsAttention ? Color.orange : (session.hasFailed ? Color.red : (session.isRunning ? Color.green : Color.white.opacity(0.45))))
             }
             Text(showsTaskContent ? session.output : "Contenido oculto")
                 .font(.system(size: 11, design: .monospaced))
@@ -504,7 +654,7 @@ private struct SessionCard: View {
         .background(Color.white.opacity(session.isRunning ? 0.09 : 0.055), in: RoundedRectangle(cornerRadius: 14))
         .overlay(alignment: .leading) {
             RoundedRectangle(cornerRadius: 2)
-                .fill(session.isRunning ? Color.green : Color.clear)
+                .fill(session.needsAttention ? Color.orange : (session.hasFailed ? Color.red : (session.isRunning ? Color.green : Color.clear)))
                 .frame(width: 3)
                 .padding(.vertical, 12)
         }

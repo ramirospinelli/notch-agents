@@ -12,6 +12,7 @@ struct CodexSession: Identifiable, Equatable, Sendable {
 
     var deepLink: URL { URL(string: "codex://threads/\(id)")! }
     var needsAttention: Bool { ["Requiere aprobación", "Requiere respuesta"].contains(activity) }
+    var hasFailed: Bool { ["Falló", "Interrumpido"].contains(activity) }
 
     func applying(_ liveState: CodexLiveState) -> CodexSession {
         guard let activity = liveState.activity else { return self }
@@ -69,7 +70,7 @@ enum CodexSessionReader {
         .sorted { $0.1 > $1.1 }
         .prefix(limit)
         .compactMap { url, date in parseFile(url, modifiedAt: date) }
-        .filter { $0.title != "Sesión Codex" || $0.isRunning }
+        .filter { $0.title != "Sesión Codex" || $0.isRunning || $0.needsAttention || $0.hasFailed }
     }
 
     static func parse(lines: [String], fallbackID: String, modifiedAt: Date = .now) -> CodexSession? {
@@ -81,6 +82,8 @@ enum CodexSessionReader {
         var running = false
         var sawCodexEvent = false
         var usage: CodexUsage?
+        var pendingApproval = false
+        var pendingQuestionCallIDs = Set<String>()
 
         for line in lines {
             guard let data = line.data(using: .utf8),
@@ -104,10 +107,23 @@ enum CodexSessionReader {
             case ("event_msg", "task_complete"):
                 running = false
                 activity = "Completado"
+                pendingApproval = false
+                pendingQuestionCallIDs.removeAll()
                 sawCodexEvent = true
             case ("event_msg", "turn_aborted"), ("event_msg", "thread_rolled_back"):
                 running = false
                 activity = "Interrumpido"
+                pendingApproval = false
+                pendingQuestionCallIDs.removeAll()
+                sawCodexEvent = true
+            case ("event_msg", "turn_failed"), ("event_msg", "error"):
+                running = false
+                activity = "Falló"
+                if let message = payload["message"] as? String, !message.isEmpty {
+                    output = clean(message)
+                }
+                pendingApproval = false
+                pendingQuestionCallIDs.removeAll()
                 sawCodexEvent = true
             case ("event_msg", "agent_message"):
                 if let message = payload["message"] as? String, !message.isEmpty {
@@ -129,11 +145,25 @@ enum CodexSessionReader {
                 let name = payload["name"] as? String ?? "herramienta"
                 activity = activityLabel(for: name)
                 let input = (payload["arguments"] as? String) ?? (payload["input"] as? String)
+                if name == "request_user_input", let callID = payload["call_id"] as? String {
+                    pendingQuestionCallIDs.insert(callID)
+                }
+                if input?.contains("sandbox_permissions") == true,
+                   input?.contains("require_escalated") == true {
+                    pendingApproval = true
+                }
                 if let input, let detail = commandDetail(from: input) {
                     output = detail
                 }
             case ("response_item", "custom_tool_call_output"), ("response_item", "function_call_output"):
-                if let text = outputText(payload["output"]), !text.isEmpty {
+                let text = outputText(payload["output"])
+                if let callID = payload["call_id"] as? String {
+                    pendingQuestionCallIDs.remove(callID)
+                }
+                if pendingApproval, isFinalToolOutput(payload["output"]) {
+                    pendingApproval = false
+                }
+                if let text, !text.isEmpty {
                     output = clean(text)
                 }
             default:
@@ -142,6 +172,11 @@ enum CodexSessionReader {
         }
 
         guard sawCodexEvent else { return nil }
+        if pendingApproval {
+            activity = "Requiere aprobación"
+        } else if !pendingQuestionCallIDs.isEmpty {
+            activity = "Requiere respuesta"
+        }
         let project = cwd.isEmpty ? "Codex" : URL(fileURLWithPath: cwd).lastPathComponent
         return CodexSession(
             id: id,
@@ -231,10 +266,21 @@ enum CodexSessionReader {
     }
 
     private static func outputText(_ value: Any?) -> String? {
+        if let value = value as? String { return value }
         guard let items = value as? [[String: Any]] else { return nil }
         return items.compactMap { $0["text"] as? String }.last(where: {
             !["", "[]", "{}", "null"].contains($0.trimmingCharacters(in: .whitespacesAndNewlines))
         })
+    }
+
+    private static func isFinalToolOutput(_ value: Any?) -> Bool {
+        let texts: [String]
+        if let value = value as? String {
+            texts = [value]
+        } else {
+            texts = (value as? [[String: Any]])?.compactMap { $0["text"] as? String } ?? []
+        }
+        return texts.contains { $0.hasPrefix("Script completed") || $0.hasPrefix("Script failed") }
     }
 
     private static func commandDetail(from arguments: String) -> String? {

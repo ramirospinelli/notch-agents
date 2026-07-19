@@ -64,6 +64,7 @@ import AppKit
 @Test func connectsToTheRunningCodexServerWhenItsSocketExists() {
     #expect(CodexAppServerClient.launchArguments(socketPath: "/tmp/codex.sock") == ["app-server", "proxy", "--sock", "/tmp/codex.sock"])
     #expect(CodexAppServerClient.launchArguments(socketPath: nil) == ["app-server", "--listen", "stdio://"])
+    #expect(CodexAppServerClient.launchArguments(socketPath: "/tmp/stale.sock", prefersSocket: false) == ["app-server", "--listen", "stdio://"])
 }
 
 @Test func findsOnlyCodexProcesses() {
@@ -122,6 +123,21 @@ import AppKit
     let session = try #require(CodexSessionReader.parse(lines: lines, fallbackID: "fallback"))
     #expect(!session.isRunning)
     #expect(session.activity == "Interrumpido")
+    #expect(newlyCompletedSessionIDs(previouslyRunning: ["thread-3"], sessions: [session]).isEmpty)
+    #expect(newlyFailedSessionIDs(previouslyRunning: ["thread-3"], sessions: [session]) == ["thread-3"])
+}
+
+@Test func marksErrorsAsFailedWithTheirMessage() throws {
+    let lines = [
+        #"{"type":"session_meta","payload":{"id":"failed-thread"}}"#,
+        #"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        #"{"type":"event_msg","payload":{"type":"error","message":"Se agotó el límite"}}"#
+    ]
+
+    let session = try #require(CodexSessionReader.parse(lines: lines, fallbackID: "fallback"))
+    #expect(!session.isRunning)
+    #expect(session.activity == "Falló")
+    #expect(session.output == "Se agotó el límite")
 }
 
 @Test func readsCurrentFunctionCallsAndInputs() throws {
@@ -135,4 +151,70 @@ import AppKit
     let session = try #require(CodexSessionReader.parse(lines: lines, fallbackID: "fallback"))
     #expect(session.activity == "Ejecutando comando")
     #expect(session.output == "$ git status")
+}
+
+@Test func detectsPendingApprovalFromTheSessionLog() throws {
+    let lines = [
+        #"{"type":"session_meta","payload":{"id":"thread-5"}}"#,
+        #"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        #"{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"approval-1","name":"exec","input":"tools.exec_command({\"sandbox_permissions\":\"require_escalated\"})"}}"#,
+        #"{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"approval-1","output":"Script running with cell ID 42\nWall time 10.0 seconds\nOutput:\n"}}"#
+    ]
+
+    let pending = try #require(CodexSessionReader.parse(lines: lines, fallbackID: "fallback"))
+    #expect(pending.activity == "Requiere aprobación")
+    #expect(pending.needsAttention)
+
+    let unrelatedOutput = #"{"type":"response_item","payload":{"type":"function_call_output","call_id":"unrelated","output":"other tool output"}}"#
+    #expect(CodexSessionReader.parse(lines: lines + [unrelatedOutput], fallbackID: "fallback")?.needsAttention == true)
+
+    let resolved = try #require(CodexSessionReader.parse(
+        lines: lines + [
+            unrelatedOutput,
+            #"{"type":"response_item","payload":{"type":"function_call_output","call_id":"resolution-1","output":[{"type":"input_text","text":"Script failed: rejected by user"},{"type":"input_text","text":"rejected"}]}}"#
+        ],
+        fallbackID: "fallback"
+    ))
+    #expect(!resolved.needsAttention)
+}
+
+@Test func detectsPendingQuestionFromTheSessionLog() throws {
+    let lines = [
+        #"{"type":"session_meta","payload":{"id":"thread-6"}}"#,
+        #"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        #"{"type":"response_item","payload":{"type":"function_call","call_id":"question-1","name":"request_user_input","arguments":"{\"questions\":[]}"}}"#
+    ]
+
+    let pending = try #require(CodexSessionReader.parse(lines: lines, fallbackID: "fallback"))
+    #expect(pending.activity == "Requiere respuesta")
+
+    let resolved = try #require(CodexSessionReader.parse(
+        lines: lines + [#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"question-1","output":"{\"answers\":{}}"}}"#],
+        fallbackID: "fallback"
+    ))
+    #expect(!resolved.needsAttention)
+}
+
+@Test func prioritizesSessionsThatNeedAttention() {
+    let base = CodexSession(id: "running", title: "", project: "", output: "", activity: "Trabajando", isRunning: true, updatedAt: .now, usage: nil)
+    let approval = CodexSession(id: "approval", title: "", project: "", output: "", activity: "Requiere aprobación", isRunning: true, updatedAt: .now, usage: nil)
+    let completed = CodexSession(id: "completed", title: "", project: "", output: "", activity: "Completado", isRunning: false, updatedAt: .now, usage: nil)
+    let failed = CodexSession(id: "failed", title: "", project: "", output: "", activity: "Falló", isRunning: false, updatedAt: .now, usage: nil)
+
+    #expect([completed, base, approval, failed].sorted { sessionPriority($0) < sessionPriority($1) }.map(\.id) == ["approval", "failed", "running", "completed"])
+}
+
+@Test func identifiesOnlyNewlyCompletedSessions() {
+    let completed = CodexSession(id: "just-finished", title: "", project: "", output: "", activity: "Completado", isRunning: false, updatedAt: .now, usage: nil)
+    let running = CodexSession(id: "still-running", title: "", project: "", output: "", activity: "Trabajando", isRunning: true, updatedAt: .now, usage: nil)
+    let old = CodexSession(id: "already-finished", title: "", project: "", output: "", activity: "Completado", isRunning: false, updatedAt: .now, usage: nil)
+
+    #expect(newlyCompletedSessionIDs(
+        previouslyRunning: ["just-finished", "still-running"],
+        sessions: [completed, running, old]
+    ) == ["just-finished"])
+    #expect(visibleUnreadSessionIDs(
+        ["just-finished", "still-running", "removed"],
+        sessions: [completed, running]
+    ) == ["just-finished"])
 }
