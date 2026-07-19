@@ -226,6 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var panel: NSPanel?
     private var globalClickMonitor: Any?
     private var localClickMonitor: Any?
+    private var hoverExpansion: DispatchWorkItem?
     private lazy var completionSound: NSSound? = {
         let sound = NSSound(named: "Glass")
         sound?.volume = 0.2
@@ -255,6 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        hoverExpansion?.cancel()
         if let globalClickMonitor { NSEvent.removeMonitor(globalClickMonitor) }
         if let localClickMonitor { NSEvent.removeMonitor(localClickMonitor) }
     }
@@ -287,6 +289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private func setExpanded(_ expanded: Bool) {
         guard monitor.isExpanded != expanded else { return }
+        if expanded { hoverExpansion?.cancel() }
         monitor.isExpanded = expanded
         guard let panel else { return }
         resize(panel, animated: true)
@@ -295,6 +298,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private func collapseIfNeeded() {
         guard let panel, shouldCollapsePanel(expanded: monitor.isExpanded, panelFrame: panel.frame, clickLocation: NSEvent.mouseLocation) else { return }
         setExpanded(false)
+    }
+
+    private func handleHover(_ hovering: Bool) {
+        hoverExpansion?.cancel()
+        guard hovering, !monitor.isExpanded else { return }
+        let expansion = DispatchWorkItem { [weak self] in self?.setExpanded(true) }
+        hoverExpansion = expansion
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: expansion)
     }
 
     private func makePanel() -> NSPanel {
@@ -316,7 +327,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         panel.titlebarAppearsTransparent = true
         panel.contentView = NSHostingView(rootView: NotchView(
             monitor: monitor,
-            onToggle: { [weak self] in self?.togglePanel() }
+            onToggle: { [weak self] in self?.togglePanel() },
+            onHoverChanged: { [weak self] in self?.handleHover($0) }
         ))
         return panel
     }
@@ -380,9 +392,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        if let id = response.notification.request.content.userInfo["threadId"] as? String,
-           let url = URL(string: "codex://threads/\(id)") {
-            DispatchQueue.main.async { NSWorkspace.shared.open(url) }
+        if let id = response.notification.request.content.userInfo["threadId"] as? String {
+            Task { @MainActor [weak self] in
+                if let session = self?.monitor.sessions.first(where: { $0.id == id }) {
+                    self?.monitor.openThread(session)
+                } else if let url = URL(string: "codex://threads/\(id)") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
         }
         completionHandler()
     }
@@ -392,6 +409,7 @@ struct NotchView: View {
     @ObservedObject var monitor: AgentMonitor
     @AppStorage("showsTaskContent") private var showsTaskContent = false
     let onToggle: () -> Void
+    let onHoverChanged: (Bool) -> Void
 
     var body: some View {
         Group {
@@ -425,6 +443,7 @@ struct NotchView: View {
             topTrailingRadius: 0,
             style: .continuous
         ))
+        .onHover(perform: onHoverChanged)
     }
 
     private var expandedView: some View {
@@ -635,6 +654,9 @@ private struct SessionCard: View {
                 Text(session.project.uppercased())
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.38))
+                Text(session.updatedAt, style: .relative)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.3))
             }
             HStack(spacing: 6) {
                 if session.isRunning {
