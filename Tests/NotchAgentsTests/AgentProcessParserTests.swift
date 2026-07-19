@@ -49,6 +49,12 @@ import AppKit
     #expect(!shouldAnimateMascot(isProcessing: true, reduceMotion: true))
 }
 
+@Test func colorsMascotByAgentState() {
+    #expect(mascotState(hasPendingApproval: false, hasRunning: false) == .idle)
+    #expect(mascotState(hasPendingApproval: false, hasRunning: true) == .processing)
+    #expect(mascotState(hasPendingApproval: true, hasRunning: true) == .blocked)
+}
+
 @Test func enablesTheCompletionCueUnlessTheUserDisablesIt() {
     #expect(shouldPlayCompletionSound(preference: nil))
     #expect(shouldPlayCompletionSound(preference: true))
@@ -63,24 +69,87 @@ import AppKit
     #expect(notificationWarning(.authorized) == nil)
 }
 
-@Test func readsCodexAppServerAttentionStates() throws {
-    let approval = try #require(CodexAppServerEvent.parse(#"{"method":"thread/status/changed","params":{"threadId":"thread-1","status":{"type":"active","activeFlags":["waitingOnApproval"]}}}"#))
-    let question = try #require(CodexAppServerEvent.parse(#"{"method":"thread/started","params":{"thread":{"id":"thread-2","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}}}"#))
+@Test func framesDesktopIPCMessagesAcrossPartialReads() throws {
+    let message: [String: Any] = ["type": "request", "method": "initialize"]
+    let framed = try CodexDesktopIPCClient.frame(message)
+    var buffer = Data(framed.prefix(5))
 
-    #expect(approval.threadID == "thread-1")
-    #expect(approval.state == .waitingApproval)
-    #expect(question.threadID == "thread-2")
-    #expect(question.state == .waitingQuestion)
-
-    let approvalRequest = try #require(CodexAppServerEvent.parse(#"{"id":7,"method":"execCommandApproval","params":{"conversationId":"thread-3"}}"#))
-    #expect(approvalRequest.threadID == "thread-3")
-    #expect(approvalRequest.state == .waitingApproval)
+    #expect(CodexDesktopIPCClient.drainFrames(from: &buffer).isEmpty)
+    buffer.append(framed.dropFirst(5))
+    let decoded = try #require(CodexDesktopIPCClient.drainFrames(from: &buffer).first)
+    #expect(decoded["method"] as? String == "initialize")
+    #expect(buffer.isEmpty)
 }
 
-@Test func connectsToTheRunningCodexServerWhenItsSocketExists() {
-    #expect(CodexAppServerClient.launchArguments(socketPath: "/tmp/codex.sock") == ["app-server", "proxy", "--sock", "/tmp/codex.sock"])
-    #expect(CodexAppServerClient.launchArguments(socketPath: nil) == ["app-server", "--listen", "stdio://"])
-    #expect(CodexAppServerClient.launchArguments(socketPath: "/tmp/stale.sock", prefersSocket: false) == ["app-server", "--listen", "stdio://"])
+@Test func readsActionableRequestsFromDesktopSnapshots() throws {
+    let command = try #require(CodexPendingRequest.parse([
+        "id": "approval-1",
+        "method": "item/commandExecution/requestApproval",
+        "params": ["reason": "Necesita acceso", "command": "git push"]
+    ], conversationID: "thread-1"))
+    let question = try #require(CodexPendingRequest.parse([
+        "id": 7,
+        "method": "item/tool/requestUserInput",
+        "params": ["questions": [[
+            "id": "environment",
+            "header": "Entorno",
+            "question": "¿Dónde lo desplegamos?",
+            "options": [["label": "Producción", "description": "Publica ahora"]]
+        ]]]
+    ], conversationID: "thread-2"))
+    let permissions = try #require(CodexPendingRequest.parse([
+        "id": "permission-1",
+        "method": "item/permissions/requestApproval",
+        "params": ["reason": "Necesita red", "cwd": "/tmp/project", "permissions": ["network": ["enabled": true]]]
+    ], conversationID: "thread-3"))
+
+    #expect(command.id == "approval-1")
+    #expect(command.kind == .command)
+    #expect(command.detail == "git push")
+    #expect(question.id == "7")
+    #expect(question.kind == .userInput)
+    #expect(question.questions.first?.options.first?.label == "Producción")
+    #expect(permissions.kind == .permissions)
+    #expect(permissions.detail == "Acceso a internet")
+}
+
+@Test func buildsDesktopApprovalAndAnswerRequests() throws {
+    let command = CodexPendingRequest(id: "approval-1", conversationID: "thread-1", kind: .command, title: "Aprobación", detail: "git push", questions: [])
+    let decision = CodexDesktopIPCClient.actionMessage(
+        for: command,
+        clientID: "notch",
+        ownerID: "codex",
+        decision: .accept
+    )
+    let params = try #require(decision["params"] as? [String: Any])
+    #expect(decision["method"] as? String == "thread-follower-command-approval-decision")
+    #expect(decision["targetClientId"] as? String == "codex")
+    #expect(params["decision"] as? String == "accept")
+
+    let permission = try #require(CodexPendingRequest.parse([
+        "id": "permission-1",
+        "method": "item/permissions/requestApproval",
+        "params": ["permissions": ["network": ["enabled": true]]]
+    ], conversationID: "thread-1"))
+    let permissionApproval = CodexDesktopIPCClient.actionMessage(for: permission, clientID: "notch", ownerID: "codex", decision: .accept)
+    let permissionParams = try #require(permissionApproval["params"] as? [String: Any])
+    let permissionResponse = try #require(permissionParams["response"] as? [String: Any])
+    let granted = try #require(permissionResponse["permissions"] as? [String: Any])
+    #expect(permissionApproval["method"] as? String == "thread-follower-permissions-request-approval-response")
+    #expect((granted["network"] as? [String: Any])?["enabled"] as? Bool == true)
+
+    let question = CodexPendingRequest(id: "question-1", conversationID: "thread-1", kind: .userInput, title: "Pregunta", detail: "", questions: [])
+    let answer = CodexDesktopIPCClient.answerMessage(
+        for: question,
+        answers: ["environment": "Producción"],
+        clientID: "notch",
+        ownerID: "codex"
+    )
+    let answerParams = try #require(answer["params"] as? [String: Any])
+    let response = try #require(answerParams["response"] as? [String: Any])
+    let answers = try #require(response["answers"] as? [String: Any])
+    let environment = try #require(answers["environment"] as? [String: Any])
+    #expect(environment["answers"] as? [String] == ["Producción"])
 }
 
 @Test func findsOnlyCodexProcesses() {

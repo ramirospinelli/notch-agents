@@ -28,6 +28,15 @@ func shouldAnimateMascot(isProcessing: Bool, reduceMotion: Bool) -> Bool {
     isProcessing && !reduceMotion
 }
 
+enum MascotState: Equatable {
+    case idle, processing, blocked
+}
+
+func mascotState(hasPendingApproval: Bool, hasRunning: Bool) -> MascotState {
+    if hasPendingApproval { return .blocked }
+    return hasRunning ? .processing : .idle
+}
+
 func shouldPlayCompletionSound(preference: Bool?) -> Bool {
     preference ?? true
 }
@@ -99,6 +108,7 @@ final class AgentMonitor: ObservableObject {
     @Published private(set) var unreadCompletedSessionIDs = Set<String>()
     @Published private(set) var unreadFailedSessionIDs = Set<String>()
     @Published private(set) var appServerConnected = false
+    @Published private(set) var pendingRequests: [CodexPendingRequest] = []
     @Published private(set) var notificationAuthorizationStatus: UNAuthorizationStatus = .notDetermined
     @Published var isExpanded = false
     var onSessionCompleted: ((CodexSession) -> Void)?
@@ -106,14 +116,13 @@ final class AgentMonitor: ObservableObject {
     var onAttentionNeeded: ((CodexSession) -> Void)?
     private var timer: Timer?
     private var timerInterval: TimeInterval?
-    private var liveStates: [String: CodexLiveState] = [:]
-    private var appServerClient: CodexAppServerClient?
+    private var appServerClient: CodexDesktopIPCClient?
     private var appServerRestart: DispatchWorkItem?
     private var refreshInFlight = false
 
     init() {
         scheduleRefresh(every: 2)
-        startAppServer()
+        startDesktopIPC()
     }
 
     private func scheduleRefresh(every interval: TimeInterval) {
@@ -138,8 +147,8 @@ final class AgentMonitor: ObservableObject {
                 let previouslyWaiting = Set(self.sessions.filter(\.needsAttention).map(\.id))
                 self.agents = agents
                 let currentSessions = sessions.map { session in
-                    guard let liveState = self.liveStates[session.id] else { return session }
-                    return session.applying(liveState)
+                    guard let request = self.pendingRequests.first(where: { $0.conversationID == session.id }) else { return session }
+                    return session.applying(request.kind == .userInput ? .waitingQuestion : .waitingApproval)
                 }
                 let sorted = currentSessions.sorted {
                     let lhs = sessionPriority($0)
@@ -147,6 +156,7 @@ final class AgentMonitor: ObservableObject {
                     return lhs == rhs ? $0.updatedAt > $1.updatedAt : lhs < rhs
                 }
                 self.sessions = sorted
+                self.appServerClient?.follow(conversationIDs: sorted.map(\.id))
                 let completedIDs = newlyCompletedSessionIDs(previouslyRunning: previouslyRunning, sessions: sorted)
                 self.unreadCompletedSessionIDs = visibleUnreadSessionIDs(self.unreadCompletedSessionIDs, sessions: sorted)
                 self.unreadCompletedSessionIDs.formUnion(completedIDs)
@@ -167,15 +177,14 @@ final class AgentMonitor: ObservableObject {
         }
     }
 
-    private func startAppServer(prefersSocket: Bool = true) {
-        guard let client = CodexAppServerClient(prefersSocket: prefersSocket) else { return }
-        client.onEvent = { [weak self] event in
+    private func startDesktopIPC() {
+        guard let client = CodexDesktopIPCClient() else {
+            scheduleDesktopIPCRestart()
+            return
+        }
+        client.onRequestsChanged = { [weak self] requests in
             Task { @MainActor [weak self] in
-                if event.state == .idle {
-                    self?.liveStates.removeValue(forKey: event.threadID)
-                } else {
-                    self?.liveStates[event.threadID] = event.state
-                }
+                self?.pendingRequests = requests
                 self?.refresh()
             }
         }
@@ -184,25 +193,26 @@ final class AgentMonitor: ObservableObject {
                 guard let self, let client, self.appServerClient === client else { return }
                 self.appServerRestart?.cancel()
                 self.appServerConnected = true
+                client.follow(conversationIDs: self.sessions.map(\.id))
             }
         }
-        client.onExit = { [weak self, weak client] _ in
+        client.onExit = { [weak self, weak client] in
             Task { @MainActor [weak self, weak client] in
                 guard let self, let client, self.appServerClient === client else { return }
                 self.appServerConnected = false
                 self.appServerClient = nil
-                self.liveStates.removeAll()
+                self.pendingRequests.removeAll()
                 self.refresh()
-                self.scheduleAppServerRestart(prefersSocket: false)
+                self.scheduleDesktopIPCRestart()
             }
         }
         appServerClient = client
         client.start()
     }
 
-    private func scheduleAppServerRestart(prefersSocket: Bool) {
+    private func scheduleDesktopIPCRestart() {
         appServerRestart?.cancel()
-        let restart = DispatchWorkItem { [weak self] in self?.startAppServer(prefersSocket: prefersSocket) }
+        let restart = DispatchWorkItem { [weak self] in self?.startDesktopIPC() }
         appServerRestart = restart
         DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: restart)
     }
@@ -238,6 +248,14 @@ final class AgentMonitor: ObservableObject {
 
     func updateNotificationAuthorizationStatus(_ status: UNAuthorizationStatus) {
         notificationAuthorizationStatus = status
+    }
+
+    func decide(_ decision: CodexApprovalDecision, request: CodexPendingRequest) {
+        appServerClient?.decide(decision, request: request)
+    }
+
+    func answer(_ answers: [String: String], request: CodexPendingRequest) {
+        appServerClient?.answer(answers, request: request)
     }
 }
 
@@ -452,7 +470,7 @@ struct NotchView: View {
             } else {
                 Button(action: onToggle) {
                     HStack(spacing: 8) {
-                        RetroMascot(isProcessing: isProcessing)
+                        RetroMascot(state: currentMascotState)
                         Spacer()
                         Text(compactStatusText)
                             .font(.system(size: 9, weight: .bold, design: .rounded))
@@ -484,7 +502,7 @@ struct NotchView: View {
         VStack(alignment: .leading, spacing: 12) {
             Button(action: onToggle) {
                 HStack {
-                    RetroMascot(isProcessing: isProcessing)
+                    RetroMascot(state: currentMascotState)
                     Spacer()
                     Text(statusText)
                         .font(.system(size: 11, weight: .semibold, design: .rounded))
@@ -524,15 +542,25 @@ struct NotchView: View {
                 ScrollView {
                     LazyVStack(spacing: 8) {
                         ForEach(monitor.sessions) { session in
-                            Button { monitor.openThread(session) } label: {
-                                SessionCard(
-                                    session: session,
-                                    showsTaskContent: showsTaskContent,
-                                    isUnread: monitor.unreadCompletedSessionIDs.contains(session.id) || monitor.unreadFailedSessionIDs.contains(session.id)
-                                )
+                            VStack(spacing: 8) {
+                                Button { monitor.openThread(session) } label: {
+                                    SessionCard(
+                                        session: session,
+                                        showsTaskContent: showsTaskContent,
+                                        isUnread: monitor.unreadCompletedSessionIDs.contains(session.id) || monitor.unreadFailedSessionIDs.contains(session.id)
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Abrir \(showsTaskContent ? session.title : "tarea de Codex")")
+                                if let request = monitor.pendingRequests.first(where: { $0.conversationID == session.id }) {
+                                    PendingRequestView(
+                                        request: request,
+                                        onDecision: { monitor.decide($0, request: request) },
+                                        onAnswer: { monitor.answer($0, request: request) }
+                                    )
+                                    .id(request.id)
+                                }
                             }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Abrir \(showsTaskContent ? session.title : "tarea de Codex")")
                         }
                     }
                 }
@@ -613,22 +641,108 @@ struct NotchView: View {
         return .white.opacity(0.7)
     }
 
-    private var isProcessing: Bool { monitor.sessions.contains(where: \.isRunning) }
+    private var currentMascotState: MascotState {
+        mascotState(
+            hasPendingApproval: monitor.sessions.contains { $0.activity == "Requiere aprobación" },
+            hasRunning: monitor.sessions.contains(where: \.isRunning)
+        )
+    }
+}
+
+private struct PendingRequestView: View {
+    let request: CodexPendingRequest
+    let onDecision: (CodexApprovalDecision) -> Void
+    let onAnswer: ([String: String]) -> Void
+    @State private var answers: [String: String] = [:]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text(request.title)
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+            if request.kind == .userInput {
+                ForEach(request.questions, id: \.id) { question in
+                    questionField(question)
+                }
+                Button("Responder") { onAnswer(answers) }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.blue)
+                    .disabled(request.questions.contains { answers[$0.id]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false })
+            } else {
+                Text(request.detail)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.72))
+                    .textSelection(.enabled)
+                HStack {
+                    actionButton("Aprobar", decision: .accept, color: .green)
+                    actionButton("Rechazar", decision: .decline, color: .red)
+                    actionButton("Cancelar", decision: .cancel, color: .gray)
+                }
+            }
+        }
+        .padding(12)
+        .background(Color.red.opacity(0.16), in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.red.opacity(0.45)))
+    }
+
+    @ViewBuilder
+    private func questionField(_ question: CodexQuestion) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(question.question)
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+            if !question.options.isEmpty {
+                Menu(answers[question.id] ?? "Elegir una opción") {
+                    ForEach(question.options, id: \.label) { option in
+                        Button(option.label) { answers[question.id] = option.label }
+                            .help(option.description)
+                    }
+                }
+                .menuStyle(.borderlessButton)
+            }
+            TextField("Escribí tu respuesta", text: Binding(
+                get: { answers[question.id] ?? "" },
+                set: { answers[question.id] = $0 }
+            ))
+                .textFieldStyle(.roundedBorder)
+        }
+    }
+
+    private func actionButton(_ title: String, decision: CodexApprovalDecision, color: Color) -> some View {
+        Button(title) { onDecision(decision) }
+            .buttonStyle(.borderedProminent)
+            .tint(color)
+    }
 }
 
 private struct RetroMascot: View {
-    let isProcessing: Bool
+    let state: MascotState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 0.25, paused: !shouldAnimateMascot(isProcessing: isProcessing, reduceMotion: reduceMotion))) { timeline in
+        TimelineView(.animation(minimumInterval: 0.25, paused: !shouldAnimateMascot(isProcessing: state == .processing, reduceMotion: reduceMotion))) { timeline in
             let alternate = Int(timeline.date.timeIntervalSinceReferenceDate * 4).isMultiple(of: 2)
-            Text(isProcessing ? (alternate ? "▟•ᴗ•▙" : "▙•ᴗ•▟") : "▟-ᴗ-▙")
+            Text(state == .idle ? "▟-ᴗ-▙" : (alternate ? "▟•ᴗ•▙" : "▙•ᴗ•▟"))
                 .font(.system(size: 9, weight: .black, design: .monospaced))
-                .foregroundStyle(isProcessing ? Color.green : Color.white.opacity(0.4))
-                .offset(y: shouldAnimateMascot(isProcessing: isProcessing, reduceMotion: reduceMotion) && alternate ? -1 : 0)
+                .foregroundStyle(color)
+                .offset(y: shouldAnimateMascot(isProcessing: state == .processing, reduceMotion: reduceMotion) && alternate ? -1 : 0)
         }
-        .accessibilityLabel(isProcessing ? "Mascota procesando" : "Mascota en espera")
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var color: Color {
+        switch state {
+        case .idle: .green
+        case .processing: .orange
+        case .blocked: .red
+        }
+    }
+
+    private var accessibilityLabel: String {
+        switch state {
+        case .idle: "Mascota disponible"
+        case .processing: "Mascota procesando"
+        case .blocked: "Mascota esperando autorización"
+        }
     }
 }
 
